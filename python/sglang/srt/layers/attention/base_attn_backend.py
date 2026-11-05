@@ -110,6 +110,8 @@ class AttentionBackend(ABC):
     decode_attention_backend_str: Optional[str] = None
 
     supports_ragged_verify_graph: bool = False
+    # Bind-time cap on the window sub-pools one runner's layers attend through.
+    max_window_sub_pools: int = 1
     # Whether target verify runs correctly under decode context parallelism:
     # each rank reads its shard of the DCP-widened pages with the global causal
     # bound and returns its LSE for the cross-rank merge.
