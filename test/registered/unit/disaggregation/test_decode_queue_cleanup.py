@@ -73,6 +73,24 @@ class TestDecodeQueueCleanup(CustomTestCase):
         self.assertEqual(ready, {})
         self.assertEqual(remaining, [])
 
+    def test_an_empty_queue_reads_no_capacity(self):
+        """Polling an empty preallocation queue returns before the capacity
+        budgets, whose reads after an allocation search the layout again."""
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.pp_size = 1
+        queue.queue = IndexedReqList(ListKind.PD_PREALLOC)
+        queue._resolve_pending_reqs = MagicMock()
+        queue._update_handshake_waiters = MagicMock()
+        for budget in (
+            "_allocatable_token_budgets",
+            "_window_aware_allocatable_token_budgets",
+            "_uses_swa_reservation",
+        ):
+            setattr(queue, budget, MagicMock(side_effect=AssertionError(budget)))
+
+        self.assertEqual(queue.pop_preallocated(), ([], []))
+        queue._resolve_pending_reqs.assert_called_once()
+
     def test_prefetches_prefill_dp_rank_query(self):
         addr = "127.0.0.1:11500"
         executor = MagicMock()
@@ -413,6 +431,7 @@ class TestDeferredDestinationPublish(CustomTestCase):
             page_size=1,
             state=None,
             translate_kv_indices_for_transfer=lambda indices: indices,
+            window_pool_names=lambda: (),
         )
         queue.kv_manager = SimpleNamespace(kv_args=SimpleNamespace(state_types=[]))
         queue.transfer_queue = SimpleNamespace(
@@ -501,7 +520,7 @@ class TestDeferredDestinationPublish(CustomTestCase):
         receiver = _PollingReceiver()
         decode_req = self._decode_req(receiver)
         queue = self._deferring_queue([decode_req])
-        # A move an allocation needed moved pages in between.
+        # A relief that could not keep the held rows moved pages in between.
         self.storage = _HoldingStorage(epochs=(0, 1))
         self.assertEqual(queue.pop_preallocated(), ([decode_req], []))
         queue.note_destinations_queued(1)
@@ -711,8 +730,8 @@ class TestDeferredDestinationPublish(CustomTestCase):
         """A later allocation in the same pop must not move a deferred
         request's rows before its publish reads their ids back. Unified memory
         keeps no pool-wide move gate: the deferral holds the request's receive
-        rows, which an opportunistic compaction leaves in place, until the
-        publish has recorded the rows' transfer. The destination still counts as
+        rows in place, which a relief keeps whenever it can, until the publish
+        has recorded the rows' transfer. The destination still counts as
         published until the transfer queue takes it."""
         queue = self._deferring_queue([self._decode_req(_PollingReceiver())])
 

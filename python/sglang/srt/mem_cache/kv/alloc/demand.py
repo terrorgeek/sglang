@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import enum
 import math
-from typing import Callable, Iterable, Mapping, Optional
+from typing import Callable, Iterable, Mapping, NamedTuple, Optional
 
 import msgspec
 
@@ -312,6 +312,43 @@ def decode_estimate_tokens(max_new_tokens: int) -> int:
     from sglang.srt.environ import envs
 
     return min(max_new_tokens, envs.SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION.get())
+
+
+class WindowRetirement(NamedTuple):
+    """When the scheduler retires a request's window rows, as
+    `request_demand` takes it (`window_retirement`)."""
+
+    prefill_retire_lag: int
+    decode_retire_lag: int
+    eviction_interval: int
+
+
+def window_retirement(*, shares_prefixes: bool) -> WindowRetirement:
+    """When the scheduler retires a request's window rows. Without prefix
+    sharing, the overlap scheduler retires a prefill's rows a configured
+    chunk behind its frontier, which the prefill still running reads
+    (`ScheduleBatch.maybe_evict_swa`); decode retires once
+    SGLANG_SWA_EVICTION_INTERVAL rows fell out of the window, behind the
+    request's processed length. A decode step allocates rows ahead of that
+    length: the overlap scheduler's next step, allocated before the result
+    of the one running is processed, and under speculative decoding the
+    reserve every step allocates past the committed length
+    (`get_alloc_reserve_per_decode`, which covers the overlap lag too)."""
+    from sglang.srt.environ import envs
+    from sglang.srt.mem_cache.allocation_sizing import get_alloc_reserve_per_decode
+    from sglang.srt.runtime_context import get_schedule, get_spec
+
+    schedule = get_schedule()
+    chunk = schedule.chunked_prefill_size or 0
+    overlap = not schedule.disable_overlap_schedule
+    prefill_lag = chunk if overlap and not shares_prefixes and chunk > 0 else 0
+    if get_spec().speculative_algorithm:
+        decode_lag = get_alloc_reserve_per_decode()
+    else:
+        decode_lag = 1 if overlap else 0
+    return WindowRetirement(
+        prefill_lag, decode_lag, max(1, envs.SGLANG_SWA_EVICTION_INTERVAL.get())
+    )
 
 
 class DemandInputs(msgspec.Struct, frozen=True, kw_only=True):
