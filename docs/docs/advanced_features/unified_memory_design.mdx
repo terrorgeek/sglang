@@ -1,0 +1,326 @@
+---
+title: "Unified Memory Design"
+metatags:
+    description: "Design of SGLang unified memory: layout planning, capacity and admission, allocation, lazy compaction, the page lifecycle under the overlap scheduler, the per-band page ledger, HiCache and PD transfers, debugging and testing."
+---
+This page is for contributors changing `python/sglang/srt/mem_cache/kv/`, or code that allocates, frees, moves or transfers its pages. For what unified memory is and how to enable it, read [Unified Memory for Hybrid Models](/docs/advanced_features/unified_memory) first.
+
+Code is named as `path::Symbol`. Modules of the KV package are given relative to `python/sglang/srt/mem_cache/kv/` (for example `alloc/band.py`), other runtime modules relative to `python/sglang/srt/` (for example `managers/scheduler.py`), and tests relative to the repository root.
+
+## Module map
+
+| Module | Role |
+|---|---|
+| `decl.py` | What each layer stores: `KVLayerDecl` with parts, each a geometry (MHA, MLA, state) and a lifetime (`FullLifetime`, `WindowLifetime(window)`, `StateLifetime(checkpoint_interval)`) |
+| `plan.py` | `plan_kv_storage`: groups parts into sub-pools and orders them into a chain (`KVStoragePlan`) |
+| `sizing.py` | `size_plan`: solves the byte budget into token, window and state targets, concurrency and fixed allocations |
+| `memory/arena.py` | `KVArena`: the one `uint8` device region that holds every band |
+| `layout/` | Per-layout entry geometry, the typed views kernels read and write, and host layouts |
+| `alloc/band.py` | `Band` (an end of the chain) and `FloatBand` (a band between the ends): pages, frontiers, frees, takes, compaction |
+| `alloc/chain.py` | `ChainAllocator`: one allocator over all bands; every capacity question and every chain allocation |
+| `alloc/pricing.py` | Pure capacity pricing over a host-only snapshot: `feasible`, `plan`, `first_plan` |
+| `alloc/demand.py` | `KVDemand` and `request_demand`: what a request needs from each sub-pool |
+| `alloc/forward_steps.py` | `ForwardSteps` and `PendingPages`: pages freed while a forward may still touch them |
+| `alloc/page_usage.py` | `PageUsage`, the per-band page ledger, and the `CLEARANCE` rule |
+| `alloc/signals.py` | What a wait waits for: CUDA events, host copies, network transfers |
+| `alloc/id_space.py`, `alloc/runner_ids.py`, `alloc/iteration_ids.py` | Virtual-to-physical ids per sub-pool, and their translation once per iteration |
+| `requests.py` | `RequestTable`: the request rows, holding virtual ids only |
+| `storage.py` | `KVStorage`: the interface the scheduler, the prefix tree, HiCache and PD use |
+| `build.py` | `build_kv_storage`: plan, size, then construct |
+
+The entry point is `mem_cache/kv_cache_configurator.py::KVCacheConfigurator._init_unified_pools`, after `_unified_config_from_budget` has sized the plan.
+
+## From declarations to an arena
+
+```mermaid
+flowchart LR
+    D["Layer declarations<br/>_kv_layer_decls"] --> P["Plan<br/>plan_kv_storage"]
+    P --> S["Sizing<br/>size_plan"]
+    S --> B["Build<br/>build_kv_storage"]
+    B --> A["KVArena + views<br/>+ ChainAllocator<br/>+ RequestTable"]
+```
+
+1. **Declare.** `KVCacheConfigurator._kv_layer_decls` describes each local layer with `decl.py::kv_layer_decls`: a full-attention part, a window part per window length, a state part, or an attention part and a state part together.
+2. **Plan.** `plan.py::plan_kv_storage` groups parts with the same lifetime and allocation unit into one sub-pool. It refuses a plan without a full-attention owner and two geometries in one sub-pool. It sorts the sub-pools by lifetime rank (state, then windows from the longest, then full attention): the first takes the grow-up end, the last the grow-down end, the rest float. A fused draft's window or state of a lifetime the target lacks becomes a band of its own.
+3. **Size.** `sizing.py::size_plan` solves one byte budget for the concurrency it can serve: fixed allocations (the request table, scratch and request rows), state slots (a share of the chain or an explicit count), then the most full-attention tokens whose window targets also fit. It refuses a budget below one worst-case request (`check_bs1_floor`). These are boot targets: at run time any sub-pool can take any free bytes.
+4. **Build.** `build.py::build_kv_storage` allocates the arena, one view per sub-pool, a `routed_cache.py::RoutedKVCache` over the token views, the `ChainAllocator` and the `RequestTable`, and returns a `KVStorage`.
+
+### Ids
+
+A token slot has a **virtual id**, which the scheduler allocates and `req_to_token` stores, and in each sub-pool a **physical id**, which that sub-pool's kernels index. The full-attention band mints the virtual pages; a window band binds physical pages to the owner's virtual pages, and a virtual page it leaves unbound reads as the sink. The state band has its own slot id space. Each band keeps its mapping in `alloc/id_space.py::UnitIds`.
+
+Because requests hold virtual ids, a page can move without rewriting any request row. Writes are translated once per sub-pool per iteration (`alloc/iteration_ids.py::IterationIds`), reads once by `alloc/runner_ids.py::RunnerIds`; a kernel never translates.
+
+## Capacity and admission
+
+Every capacity question is one layout search over the bands, priced on a host-only snapshot.
+
+- `alloc/pricing.py::snapshot_chain` records each band's counts and byte frontiers, never hole positions, so pricing never synchronizes with the device. `ChainAllocator.pricing_snapshot` keeps a snapshot until a capacity epoch moves; every rebind of a capacity field (`alloc/band.py::_CapacityField`) moves it.
+- `alloc/pricing.py::plan` asks whether a layout serves a demand (pages per band) under one rearrangement step: `NO_MOVE` (bands in place, reusing holes and extending one side), `FLUSH_ENDS` (ends compacted) or `RELAYOUT` (floats relocated between compacted ends).
+- `alloc/pricing.py::feasible` is the one capacity question: is there any reachable layout? `first_plan` finds the least rearrangement that serves the demand.
+- `ChainAllocator.ensure_capacity` and `units_fit` answer the question the take itself answers, so a yes here is a successful take.
+
+**Admission.** `mem_cache/prefill_budget.py::ChainPrefillBudget` charges each request its full-attention tokens (input plus expected output), for each window sub-pool at most the window it retains plus this pass's transient tail, and its state slots in full. `ChainAllocator.admits` then checks the full-attention cap and the owner's free virtual ids, and calls `feasible` on `alloc/pricing.py::reclaimed_snapshot`, which credits what the prefix cache could evict per sub-pool. Which entries to evict is the cache's decision; the allocator only answers whether a demand fits (`fits_after_frees` stops an eviction walk).
+
+**Request demand.** `alloc/demand.py::request_demand` prices one request wherever its demand is asked, by the purpose's row of `DEMAND_RULES` (`DemandPurpose.CEILING`, `ADMIT`, `LOAD_BACK`, `DECODE_PREALLOC`). A window's peak follows when the scheduler retires its rows (`window_retirement`) and the retention floor of state checkpoints. `ChainAllocator.max_new_tokens_for_memory` uses the same function for the memory clip of an arriving request, so a request the clip admits is one its chunks can finish.
+
+**Pipeline parallelism.** Stages select batches independently. `KVCacheConfigurator._unified_config_from_budget` MIN-reduces the concurrency across stages and sets `full_cap_tokens`, which the owner band enforces as a live admission cap.
+
+## Allocation
+
+A band hands out writable pages in one place, `Band._acquire`, in this order:
+
+1. **Holes**: free pages inside the band's span.
+2. **Pending pages**: if holes are short, the oldest whole pending batches that cover the rest settle (`Band.settle_pending`: the current stream waits their forwards) and become holes.
+3. **Frontier growth**: the band extends toward its neighbour. A float grows toward its larger gap; an empty float is placed at the middle of its region.
+
+Every failure check runs before a settle, so a refused take changes nothing. Capacity counts pages in the same order.
+
+A chain allocation (`ChainAllocator._plan_and_take`) adds the rearrangement, *relief*, around the per-band takes:
+
+1. Plan in place, keeping out of bytes a network send still reads. If that serves the demand, take.
+2. Otherwise, if `feasible` says no, refuse before any pending page settles.
+3. Otherwise enter urgent recovery (`alloc/band.py::settle_pending_for_recovery`): read ahead on the host everything the layout will read (free lists, pending pages, in-flight write sets, transfer pages), then settle every pending batch of every band and park floats left empty.
+4. Plan with rows that unreleased network transfers touch fixed in place (`ChainAllocator._relief_plan`). Only if no such layout exists, plan with every byte, which may wait on the host for a transfer.
+5. `ChainAllocator.realize`: compact the listed ends (`Band.flush_for_allocation`), relocate floats in an order where none is copied into a block another still holds (`alloc/pricing.py::move_order`, `FloatBand.relocate_into`), then take each band's pages in chain order.
+
+A single band that is short (a HiCache load's take, for example) calls `Band.relieve`, which runs the same relief through `ChainAllocator.lay_out_for`.
+
+**Zeroing.** MHA and MLA bands zero page envelopes on hand-out (`Band._maybe_zero_pages`): kernels that load whole pages give rows past the sequence length zero weight, so a NaN left there, or a neighbouring state band's FP32 bytes read as BF16, would still reach the output.
+
+## Compaction
+
+Compaction is lazy. A free leaves a hole; holes are closed later, by moves on the schedule stream that are ordered behind every forward and transfer that may still touch the pages.
+
+| | Opportunistic flush | Urgent flush |
+|---|---|---|
+| Entry | `ChainAllocator.flush_opportunistic`, at the overlap loop's early-processing point and at idle | Relief, through `Band.flush_for_allocation` |
+| Waits on an unretired forward | Never: it stops instead. It may queue stream waits on retired forwards, whose tails can still run | Yes: the writers of the pages it moves, after its recovery entry settled the band |
+| Moves | At most `SGLANG_LAZY_COMPACTION_MAX_MOVES_PER_CALL` | Uncapped: packs every live page toward the band's end |
+| Stops at | A source an unfinished forward writes, or a fixed page. A band holding receive rows that await publication is left alone | Nothing but fixed pages, which never move |
+| Band with pending pages | Absorbs boundary holes only; the frontier never retreats over a pending page | Settled first |
+| Forward whose writes are unknown (speculative steps) | Nothing moves until it retires | Waits it |
+
+A move copies live pages from sources to holes and rebinds their virtual pages (`Band._commit_move_batch`). Before copying, it waits the newest unfinished forward and every transfer that writes a source (`Band._wait_writers`). A source some reader may still read is not reused at once:
+
+- inside the band, it stays pending as a *vacated* ledger use until its readers retire (`PageUsage.take_ready_vacated`);
+- if the move also retreats the frontier past it, its bytes leave the band and are *fenced*: whichever band later writes those bytes waits the fence first (`Band._wait_fences`).
+
+**Floats** never compact: their holes are reusable in place, and a non-urgent flush only hands back boundary holes (`FloatBand._absorb_span_boundary_holes`). A float moves only when a planned layout relocates it. An empty float, with no live, fixed or pending page, is transparent: its neighbours see through it.
+
+`Band.prewarm_compaction` runs the page-copy path once at startup, so the first serving-time move does not compile kernels or take memory outside the pools under a full arena.
+
+## Page lifecycle under the overlap scheduler
+
+### The hazard
+
+Under the overlap scheduler, forward N+1 is launched before forward N's result is processed. When processing N ends request R, N+1 may still include R. N+1:
+
+1. reads R's request row, ids and page tables in its metadata phase;
+2. reads R's KV pages for the whole forward;
+3. writes R's next slot, a page N+1 itself allocated.
+
+A static pool only has to order (1): no one writes a freed page except a later forward, which the forward stream orders. A unified pool also writes freed pages from the schedule stream, by zeroing on hand-out and by compaction, so (2) and (3) need ordering too.
+
+### Freeing is logical at once
+
+A free (`Band._free_lazy`, `FloatBand.free`) unbinds virtual and physical ids and returns the virtual ids at once, as a static pool does. It issues no stream wait. Those schedule-stream writes are safe because of the scheduler's write-after-read barrier: `managers/scheduler.py::Scheduler._apply_war_barrier` runs after each `run_batch` in the overlap loop, before the previous result is processed, and makes the schedule stream wait the running forward's `shared_read_done_event`, or the whole forward stream when the backends declared no read end (`layers/attention/base_attn_backend.py::SharedReadEnds`).
+
+### Physical pages stay pending
+
+The physical pages wait. `alloc/forward_steps.py::ForwardSteps` tracks the forwards in flight:
+
+| Scheduler hook | `ForwardSteps` call | Effect |
+|---|---|---|
+| `Scheduler._on_step_launch` | `forward_launched` | Opens a launch record, which the step's result carries to processing |
+| `Scheduler._record_unified_forward` | `KVStorage.record_forward`, then `forward_recorded` | Records the `forward_done` event and the ids the forward writes |
+| `Scheduler._on_step_processed` | `forward_processed` | Advances the processed prefix: retires the forward in each ledger and releases pages pending under it |
+
+A page freed while a recorded forward is unprocessed joins its band's pending batches (`PendingPages`), keyed by the newest unprocessed recorded forward and its event. It counts as free in every capacity check. It returns to the free list in one of two ways:
+
+- **Processing.** `Band.release_pending_through` returns every batch keyed at or before the processed forward. `_on_step_processed` runs after the result processor synchronized a completion that covers `forward_done` (`copy_done`, or `d2h_event` on a pipeline stage), so no later schedule-stream write can race it.
+- **Settling.** A take that needs pending pages first, or an urgent recovery, settles whole batches, oldest first: the current stream waits their events on the GPU, without blocking the host, and their pages become holes. The forwards stay unprocessed: pages freed under them later still pend.
+
+```mermaid
+flowchart LR
+    BF["Beyond the frontier"] -->|"take: grow"| L["Live"]
+    H["Hole"] -->|"take"| L
+    L -->|"free, nothing in flight"| H
+    L -->|"free, forward in flight"| P["Pending batch"]
+    P -->|"forward processed"| H
+    P -->|"settle: stream waits the forward"| H
+    L -->|"move source, readers unretired"| V["Vacated"]
+    V -->|"readers retired"| H
+    L -->|"move retreats the frontier"| F["Fenced bytes"]
+    F -->|"next write waits the fence"| L
+    H -->|"flush absorbs boundary holes"| BF
+```
+
+`ForwardSteps` asserts that:
+
+- no managed page is freed or allocated between a step's launch and the recording of its event, so every pending page has an event to wait;
+- recorded forwards are processed in launch order, and each records a fresh event;
+- with no recorded forward in flight, no page is pending (`ForwardSteps.check_idle`).
+
+A step without a forward of its own (a prebuilt batch) records no event: it is never a key, and its processing advances nothing.
+
+Speculative forwards write draft and verify slots reserved before launch, and their tracking slots are produced on another stream, so `_record_unified_forward` records their token and state writes as unknown. Compaction then moves nothing in those bands until the forward retires.
+
+Without the overlap scheduler and without pipeline parallelism, the forward runs on the schedule stream and its result is processed before the next allocation, so nothing is recorded and frees go straight to the free list.
+
+### Decisions follow logical progress
+
+Every allocator decision (which pages a take chooses and in what order, frontiers, capacity, admission, moves, network waits) reads logical state: counts, forwards processed, transfers released. None reads whether an event has fired on this rank. A fired event may only skip a wait that is already satisfied. So TP ranks, which see completions at different times, make identical decisions.
+
+Within one allocator operation, every host read of device state comes before the first stream wait (`alloc/band.py::allocator_operation`, `Band._before_wait`). A host read behind a wait on a running forward would park the scheduler until that forward ends.
+
+## The per-band page ledger
+
+Each band keeps a `alloc/page_usage.py::PageUsage`: one record (`PageUse`) per use of its pages that is not over yet.
+
+| Use | Recorded by | Ends |
+|---|---|---|
+| Forward writes | `Band.set_inflight_forward`, from `KVStorage.record_forward` | When the forward retires |
+| Host copy (HiCache backup or load) | `KVStorage.record_host_transfer` | At its finish event, which a later writer of its pages waits on its stream |
+| Network transfer (PD send or receive) | `KVStorage.record_network_transfer` | When released: `KVStorage.end_network_transfer`, or a move's host wait returns |
+| Vacated pages and fenced bytes | A move whose sources some reader may still read | When the readers retire |
+| Fixed pages | `PageUsage.fix`: a HiCache load reservation, or rows a relief keeps in place | `PageUsage.unfix` |
+
+A forward *retires* when the scheduler processes it (it and every earlier forward), or when a stream wait ran past its event. Retirement and transfer releases are logical, the same on every rank.
+
+### Who waits for what: `CLEARANCE`
+
+The next writer of a page, a `Consumer`, must clear every `Hazard` the ledger records on it. `CLEARANCE` is the one rule:
+
+| Consumer | `FORWARD` | `COPY_READ`, `COPY_WRITE` | `NETWORK` | `FIXED` |
+|---|---|---|---|---|
+| `FORWARD`: the next forward | none: the forward stream orders it | stream wait | host wait | excluded |
+| `SCHEDULE_COPY`: a move or a state copy | stream wait | stream wait | host wait | excluded |
+| `ZERO`: zeroing on hand-out | stream wait | stream wait | host wait | excluded |
+| `HOST_LOAD`: a HiCache load | none: its copy stream waits the forward stream first | stream wait | host wait | excluded |
+| `NETWORK_RECEIVE`: a PD receive | after retire: the page id reaches the peer only after the forward | stream wait | host wait | excluded |
+
+The `FORWARD` hazard here is a running forward that may still read the old bytes of a page a move vacated. A page its owner freed under a running forward carries the same meaning through its pending batch instead, and is cleared when that forward is processed or the batch settles.
+
+`Band._take_holes` chooses holes by one rule over retirement and releases only: holes no unretired forward makes the consumer wait for come first. What the chosen pages must clear is read after the choice.
+
+## HiCache and PD as ledger uses
+
+### HiCache
+
+- **Backup.** The device-to-host copy stream first waits the forward stream, and the copy is recorded as a reader (`COPY_READ`). A move of a page it reads does not wait; the vacated source is reused only after the copy ends.
+- **Load.** `Band.alloc_physical` takes the destination pages and fixes them under a load reservation until the host-to-device copy is submitted. If the band has pending pages and its holes do not cover the load, it settles first. At submission, `managers/cache_controller.py::HiCacheController.start_loading` records the copy as a writer (`COPY_WRITE`) and ends the reservation (`KVStorage.end_load_reservations`), with no gap between the two. The copy stream waits the forward stream before it starts.
+- **Host pools.** Each sub-pool has its own host pool, laid out like its view. The two end sub-pools share one page-envelope host backing when both hold MHA pages (`memory/host.py::page_envelope_pair`); a float always keeps its own.
+
+### PD disaggregation
+
+- **Transfers.** Each send or receive is one `NETWORK` use, keyed by an `alloc/signals.py::NetworkTransfer`. The transfer engine runs outside every CUDA stream, so a wait for it is a host wait through `disaggregation/utils.py::NetworkTransferWaiter`: each rank judges its own engine, the judgements are MIN-reduced across the ranks that share the layout, and every rank returns in the same round.
+- **Moves avoid transfers.** A relief first plans with every network-held row fixed in place, and with no band extending into bytes a send still reads. Only when no such layout exists does it move them, waiting on the host.
+- **Receive rows.** A decode node takes a request's receive rows and holds them (`KVStorage.hold_receive_rows`, an `alloc/signals.py::ReceiveHold`) until their physical ids are published. Opportunistic compaction leaves held rows, and relief keeps them in place when it can.
+- **Publication ordering.** The peer may write a destination as soon as it learns its page ids, so publication must follow every earlier use of those pages. A take of pages a forward may still use first queues its wait on the schedule stream, so a readback of the ids on that stream follows it. With deferred publication (`SGLANG_ENABLE_DISAGG_DECODE_DEFERRED_PUBLISH`, used under the overlap scheduler on CUDA without pipeline parallelism), `disaggregation/decode.py::DecodePreallocQueue.publish_pending_destinations` publishes in a later iteration, after every forward launched before the allocation was processed, reading the ids back on a separate stream gated on the allocation's event. If a page moved since the allocation (`KVStorage.move_epoch`), the readback waits the schedule stream instead, and a held send re-reads its ids before it goes.
+
+## Windows, the prefix tree and checkpoints
+
+- **Window retirement.** As a request advances, `KVStorage.advance` frees the window rows that fell out of each window (`advance.py::retire_window_rows`): a logical free like any other.
+- **Prefix tree.** The tree keeps one slot per sub-pool (`KVStoragePlan.tree_slots`), in drive order: full attention, then windows from the longest, then state. A window slot keeps the window's retained length. Tree eviction is a logical free; a node that the forward in flight still reads may be evicted, because its pages stay pending until that forward is processed. `KVStorage.rehome_window` and `bind_window` rebind window rows without allocating; their schedule-stream writes are ordered by the write-after-read barrier like any other.
+- **Checkpoints and the retention floor.** The prefix tree caches recurrent state only at checkpoints, on a grid of `checkpoint_interval` tokens. A prefix match lands on a checkpoint, not on the request's tail, so window retirement keeps the window behind the latest checkpoint: `mem_cache/unified_radix_cache.py::UnifiedRadixCache.swa_retain_floor` sets the floor and `retire_window_rows` never frees past it. The floor applies only when the cache shares prefixes. Admission accounts for it, through `request_demand`'s `checkpoint_interval`.
+
+## Debugging and testing
+
+### Runtime checks
+
+`SGLANG_INVARIANT_CHECK` sets the signal level of invariant checks (`environ.py::InvariantCheckLevel`): `0` off, `1` warn, `2` strict. Unset, it is off, or strict when the older `SGLANG_ENABLE_ASYNC_ASSERT` is set. At `1` and above, the unified pool adds these checks, which fail at both levels:
+
+| Check | What it asserts |
+|---|---|
+| `Band._check_host_read` | No host read of device state follows a stream wait in the same allocator operation |
+| `Band._assert_ready_for_geometry` | Layout-changing geometry (urgent compaction, relocation, parking) sees a band with no pending page and, inside a recovery, a valid host copy of its free list |
+| `band.free_outside_reservation` | An owner free never names a page reserved for a HiCache load |
+| `chain.window_segment_bound`, `chain.window_segment_released` | Window segment frees name rows still bound to the window, and full-attention segment frees name rows every window already released |
+
+Other checks:
+
+- The `ForwardSteps` assertions above are always on.
+- At idle, the scheduler checks each sub-pool for leaked pages, the request table's row states, and the arena's byte conservation (`ChainAllocator.verify_byte_accounting`, including stale capacity snapshots). `SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE` (on by default) makes a leak raise instead of warn.
+- `SGLANG_CHECK_KV_PAGE_INVARIANTS=1` checks physical KV pages every busy iteration.
+- `SGLANG_LOG_LAZY_COMPACTION_STATS=1` logs compaction counters per sub-pool.
+
+### Page-safety stress harness
+
+`python/sglang/test/unified_page_safety_harness.py` runs seeded random operation sequences against a real `ChainAllocator` over a real arena (an owner end, one or two floating windows and a state end, with mixed entry and page sizes). The operations are scheduler-level: overlapped forwards, frees under running forwards, window retirement, HiCache loads and backups, network sends and receives, flushes, reliefs, float relocations, state copies and hand-out zeroing. A modeled device runs them on two simulated ranks with different completion timing. After every operation it checks:
+
+| Check | Meaning |
+|---|---|
+| `lost_write` | Every live virtual page holds what its last writer wrote, and every transfer reads what it was handed |
+| `unordered_overlap` | No two actors touch the same bytes unless one is ordered after the other |
+| `host_read_after_wait` | No host read of device state follows a stream wait on unfinished work in the same step |
+| `rank_divergence` | Both ranks make the same layout decisions |
+| `cross_dtype_bytes` | Bytes last written as FP32 state never reach an attention page a running forward reads |
+| `ledger_leak` | At quiescence, the ledger keeps no record of work that ended |
+
+A failing sequence is shrunk to a minimal one. The CUDA device runs the same operations on real streams with delayed kernels, where the payload, divergence and ledger checks apply.
+
+```bash
+# Many seeds on the CPU model, minimizing failures
+python3 test/manual/mem_cache/unified_page_safety_stress.py \
+  --seeds 0:200 --ops 400 --jobs 32 --minimize --out /tmp/stress
+# Replay a saved failing case
+python3 test/manual/mem_cache/unified_page_safety_stress.py --replay case.json
+# Real CUDA streams
+python3 test/manual/mem_cache/unified_page_safety_stress.py --device cuda --seeds 0:8 --ops 200
+```
+
+CI runs a fast slice (`test_unified_page_safety_stress.py`) and two weekly sweeps (`test_unified_page_safety_sweep.py` on CPU, `test_unified_page_safety_sweep_cuda.py` on one GPU).
+
+### Allocator traces
+
+`python/sglang/test/unified_allocator_trace.py` records and replays allocator operation traces. `test/manual/mem_cache/unified_trace_compare.py` compares two implementations on the same traces, from seeds or from the scenarios in `test/manual/mem_cache/unified_trace_scenarios/`, and prints the first divergence of each run:
+
+```bash
+# On the base checkout
+python3 test/manual/mem_cache/unified_trace_compare.py record --out base.jsonl
+# On the candidate checkout
+python3 test/manual/mem_cache/unified_trace_compare.py compare --trace base.jsonl
+```
+
+`test/registered/unit/mem_cache/test_unified_allocator_trace.py` replays the scenarios in CI.
+
+### Key unit tests
+
+All under `test/registered/unit/mem_cache/`:
+
+| Area | Files |
+|---|---|
+| Plan, layout and sizing | `test_unified_layout_golden.py`, `test_unified_byte_budget_sizing.py`, `test_unified_window_sub_pools.py`, `test_unified_window_budgets.py`, `test_unified_kv_storage.py` |
+| Pricing and admission | `test_unified_pricing_property.py`, `test_unified_chain_realize.py`, `test_unified_admission_rule.py`, `test_unified_capacity_memo.py`, `test_unified_reclaim_victim_loop.py` |
+| Page lifecycle | `test_unified_release_after_forward.py`, `test_unified_pending_event_batches.py`, `test_unified_scheduler_hooks.py`, `test_unified_page_writability.py` |
+| Ledger and transfers | `test_unified_page_usage.py`, `test_unified_transfer_ordering.py`, `test_unified_host_transfer_tracking.py`, `test_unified_hicache_transfer_lifecycle.py`, `test_unified_take_clearance_runs.py` |
+| No host sync | `test_unified_free_no_host_sync.py`, `test_unified_scheduling_no_host_sync.py`, `test_unified_take_host_work.py` |
+| Chains and compaction | `test_unified_tri_pool.py`, `test_multi_ended_allocator.py`, `test_unified_float_move_gate.py`, `test_unified_fixed_free_pages.py`, `test_unified_handout_zeroing.py` |
+
+Run one with `python3 test/registered/unit/mem_cache/test_unified_page_usage.py`. Several of them need a CUDA device.
+
+## Known limitations
+
+The guarantees above rest on the write-after-read barrier for the logical half of a free. These paths break it, or are outside the ledger's guarantee. Each carries a `FIXME` at the code named.
+
+**Forward-time reads after the declared shared-read end.** The barrier releases the schedule stream once the forward declares its shared reads done. A path that reads request-pool state indices or the state slots' virtual-to-physical map after that point can see a finished request's row or slot already reused and rewritten:
+
+- `models/qwen4_exp.py::_prepare_ple_batch` reads them inside the model forward. Qwen4-Exp refuses unified memory today.
+- `speculative/spec_utils.py::commit_mamba_states_after_verify`, on its ReplaySSM branch, when the target runner is the forward's last shared reader. EAGLE v2's post-verify graphs replay this commit on a side stream that is joined only after draft extend, after draft extend's declared read end.
+- `layers/attention/hybrid_linear_attn_backend.py::HybridLinearAttnBackend.update_mamba_state_after_mtp_verify`, on the pipeline-parallel stable-rows path.
+- `layers/attention/linear/inkling_sconv_backend.py::InklingShortConvAttnBackend.commit_conv_state_after_mtp_verify`, off the CUDA-graph-recordable path.
+
+The fix is to declare a later read end for these paths, or to gather the indices during metadata preparation.
+
+**Request-row state reset on the schedule stream.** `state_storage.py::StateStorage.acquire` resets the speculative ReplaySSM cursors of a reused request row on the schedule stream, while the previous request's forward may still advance them. The barrier orders only shared reads, not this write.
+
+**The barrier is not always applied.**
+
+- Off CUDA, ROCm included, `managers/utils.py::is_war_barrier_enabled` keeps it off unless `SGLANG_ENABLE_WAR_BARRIER=1`.
+- `managers/scheduler_pp_mixin.py::SchedulerPPMixin.event_loop_pp` never applies it, so an in-flight microbatch can read unbound or rebound mappings.
+
+**PD failed transfers.** A transfer's release is the point its rows may move or be reused. For failed transfers, that point does not prove the engine stopped:
+
+- On prefill, `disaggregation/prefill.py::_send_done` counts a failed or cleared room's send as done at once, while the engine may still read its source rows.
+- On decode, `disaggregation/decode.py::DecodeTransferQueue._failed_receive_quiescent` and `resolve_deferred_releases` release a failed receive's destination at a deadline, and `pop_transferred_with_outcomes` releases it at once when deferred release is off. A late remote write can then land in reused pages.
